@@ -3,9 +3,14 @@
 # Ansible CliQr dynamic inventory provider
 # Copyright 2015, Matt Davis (mdavis+cliqr@ansible.com)
 
-import requests, json, subprocess, os, tempfile
+import requests, json, subprocess, os, tempfile, sys, stat
 
 # TODO; support ini file
+
+# If True, persist keys to disk, otherwise, add all keys to ssh agent
+# Under Tower, persist_keys=True requires /var/tmp to be in the AWX_PROOT_SHOW_PATHS (or PROOT to be disabled)
+persist_keys = True
+
 # plug your CliQr API host and credentials in here (from User Management->Actions->Manage Access Key)
 api_host = 'yourhost.cliqr.com'
 api_user =  'your_api_user'
@@ -16,6 +21,7 @@ class CliqrInventory():
         self.api_base_url = 'https://{0}:{1}/v1/'.format(api_hostname, api_port)
         self.api_user = api_user
         self.api_key = api_key
+        self.all_keys = None
 
     def _api_get(self, resource, params=None):
         headers = {'X-CLIQR-API-KEY-AUTH' : 'true', 'Accept': 'application/json'}
@@ -42,16 +48,21 @@ class CliqrInventory():
 
         return user_keys
 
-    def _add_user_keys_to_agent(self):
-        all_keys = self._get_user_keys()
-        ssh_keys = all_keys.get('sshKeys')
+    def _add_user_keys_to_agent(self, persist_keys=False):
+        ssh_keys = self.all_keys.get('sshKeys')
         for k in ssh_keys:
-            tempfd, filename = tempfile.mkstemp()
-            tempf = os.fdopen(tempfd, 'w')
+            if persist_keys:
+                filename = '/var/tmp/' + k.get('cloud') + '.pem'
+                tempf = open(filename, 'w')
+                os.chmod(filename, stat.S_IRWXU)
+            else:
+                tempfd, filename = tempfile.mkstemp()
+                tempf = os.fdopen(tempfd, 'w')
             tempf.write(k.get('key'))
             tempf.close()
-            subprocess.call(['ssh-add',filename])
-            os.remove(filename)
+            if not persist_keys:
+                subprocess.call(['ssh-add',filename])
+                os.remove(filename)
 
     def _walk_job(self, job_detail, hosts, groups):
         appName = job_detail.get('appName', 'unknown')
@@ -64,13 +75,18 @@ class CliqrInventory():
 
         jobHosts = dict()
 
+        cloudHostSet = groups.setdefault('cloud_'+cloud, set())
+
         for jobVMEntry in jobVMEntries:
             if jobVMEntry.get('status') == 'NodeReady':
-                jobHosts[jobVMEntry.get('publicIp')] = dict(public_ip=jobVMEntry.get('publicIp'),
+                jobHosts[jobVMEntry.get('publicIp')] = dict(
+                                          public_ip=jobVMEntry.get('publicIp'),
                                           vm_id=jobVMEntry.get('id'),
                                           cloud=cloud,
-                                          ansible_ssh_user=ssh_user
+                                          ansible_ssh_user=ssh_user,
+                                          ansible_ssh_private_key_file='/var/tmp/%s.pem'%cloud
                                          )
+                cloudHostSet.add(jobVMEntry.get('publicIp'))
 
         appHostSet = groups.setdefault('appname_'+appName, set())
 
@@ -85,10 +101,11 @@ class CliqrInventory():
 
         hosts.update(jobHosts)
 
-    def get_inventory(self):
+    def get_inventory(self, persist_keys=False):
+        self.all_keys = self._get_user_keys()
         running_jobs = self._get_running_jobs()
         running_job_details = [self._get_job_detail(rj.get('id')) for rj in running_jobs]
-        self._add_user_keys_to_agent()
+        self._add_user_keys_to_agent(persist_keys)
         hosts = {}
         groups = {}
         [self._walk_job(j, hosts, groups) for j in running_job_details]
@@ -100,9 +117,11 @@ class CliqrInventory():
         return inv_dict
 
 def main():
+    persist_keys = False
+
     inv = CliqrInventory(api_host, api_user, api_key)
 
-    inv_dict = inv.get_inventory()
+    inv_dict = inv.get_inventory(True)
 
     print json.dumps(inv_dict)
 
